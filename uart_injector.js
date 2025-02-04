@@ -12,14 +12,16 @@
  *          output from the commands and saving it to the SD card.
  * 
  * **************************************/
-
-let submenu = require("submenu");
+let eventLoop = require("event_loop");
 let serial = require("serial");
 let storage = require("storage");
-let keyboard = require("keyboard");
-let dialog = require("dialog");
+let gui = require("gui");
+let submenuView = require("gui/submenu");
+let dialogView = require("gui/dialog");
+let textBoxView = require("gui/text_box");
+let textInputView = require("gui/text_input");
 
-let version = "v1.0";
+let version = "v1.1";
 
 let log_folder = "/ext/apps_data/uart_injector";
 
@@ -39,27 +41,30 @@ function Payload(title, payload, post_func) {
 ////////////////////////////////////////////
 // Post Payload handler functions
 ////////////////////////////////////////////
-function postNOP(payload) { return; }
+function postNOP() { 
+    logAppend("Payload Sent!");
+ }
 
-function postReadUntilPrompt(payload) {
-    print("Reading Output...");
+function postReadUntilPrompt() {
+    logAppend("Reading Output...");
     let console_resp = serial.readAny(2500);
-    let buf = "";
+    settings.buf = "";
     while ( console_resp !== undefined ) {
-        print(console_resp);
-        buf += console_resp;
+        logAppend(console_resp);
+        settings.buf += console_resp;
         console_resp = serial.readAny(2500);
     }
 
-    let offset = buf.indexOf(payload.payload);
+    let offset = settings.buf.indexOf(settings.payload.payload);
     if (offset > 0) {
-        buf = buf.substring(offset);
+        settings.buf = settings.buf.substring(offset);
     }
 
-    if (buf.length === 0) {
+    if (settings.buf.length === 0) {
         return
     }
-    saveData(buf)
+
+    gui.viewDispatcher.switchTo(views.keyboard);
 }
 
 ////////////////////////////////////////////
@@ -67,7 +72,7 @@ function postReadUntilPrompt(payload) {
 //     Edit these to your liking!
 ////////////////////////////////////////////
 let BAUDRATES = [
-    115200, 
+    115200,
     9600,
     4800,
     19200,
@@ -136,68 +141,96 @@ let PAYLOADS = [
     ),
 ];
 
+let views = {
+    pinoutDialog: dialogView.make(),
+    baudrateSubmenu: submenuView.make(),
+    payloadSubmenu: submenuView.make(),
+    logTextBox: textBoxView.makeWith({
+        text: "",
+        focus: "end"
+    }),
+    keyboard: textInputView.make(),
+    confirmDiscardDialog: dialogView.make(),
+    fileExistDialog: dialogView.make(),
+};
+
+let settings = {
+    baudrate: 0,
+    payload: null,
+    log: "",
+    filepath: "",
+    buf: ""
+};
+
 ////////////////////////////////////////////
 // Support functions for application
 ////////////////////////////////////////////
+function logAppend(msg) {
+    print(msg);
+    settings.log += "\n" + msg;
+    views.logTextBox.set("text", settings.log);
+}
+
 function createLogFolder() {
-    if (!storage.exists(log_folder)) {
-        let result = storage.mkdir(log_folder);
+    if (!storage.directoryExists(log_folder)) {
+        let result = storage.makeDirectory(log_folder);
         if (!result) {
-          print("Failed to create log directory");
-          print(log_folder);
-          return
+            logAppend("Failed to create log directory");
+            logAppend(log_folder);
+            return
         }
     }
 }
 
-function saveData(buf) {
+function saveData() {
     createLogFolder();
-
-    let filepath = uiGetLogFilename();
-    if (filepath.length === 0 ) {
+    if (settings.filepath.length === 0 ) {
         return;
     }
-    let result = storage.write(filepath, buf);
-    if (result) {
-       print("Saved to log file:");
-       print(filepath)
-       dialog.message("Log Saved!", filepath);
+    let file = storage.openFile(settings.filepath, "w", "create_always");
+    let result = file.write(settings.buf);
+    file.close()
+
+    if (result > 0) {
+        logAppend("Saved to log file:");
+        logAppend(settings.filepath)
     } else {
-        die("Failed to save file");
+        logAppend("Failed to save file");
     }
+    gui.viewDispatcher.switchTo(views.logTextBox);
 }
 
 function checkForPrompt() {
-    print("Check for Prompt...");
+    logAppend("Check for Prompt...");
     serial.write([0x0a]);
     let console_resp = serial.expect("# ", 1000);
     if (console_resp === undefined) {
-        print("No CLI response");
+        logAppend("No CLI response");
         return false;
     }
-    print("Got prompt!");
+    logAppend("Got prompt!");
     return true;
 }
 
-function injectCmd(baudrate, payload) {
-    serial.setup("usart", baudrate);
+function injectCmd() {
+    serial.setup("usart", settings.baudrate);
 
     if (!checkForPrompt()) {
         serial.end();
         return;
     }
 
-    print("Attempting to disable echo");
+    logAppend("Attempting to disable echo");
     serial.write("stty -echo\n");
     if (!checkForPrompt()) {
         serial.end();
         return;
     }
 
-    print("Sending Payload...");
-    serial.write(payload.payload + "\n");
+    logAppend("Sending Payload...");
+    serial.write(settings.payload.payload + "\n");
 
-    payload.post_func(payload);
+    settings.payload.post_func();
 
     serial.end();
 }
@@ -205,92 +238,144 @@ function injectCmd(baudrate, payload) {
 ////////////////////////////////////////////
 //             UI functions
 ////////////////////////////////////////////
-function uiGetBaudrate() {
-    submenu.setHeader("Choose Baudrate");
+function setupPinoutUI() {
+    //    header: "UART Injector " + version,
+    //    text: "Use Pins 13/14, select\nbaud rate & payload",
+    //    center: "OK"
+    views.pinoutDialog.set("center", "OK");
+    views.pinoutDialog.set("text", "Use Pins 13/14, select\nbaud rate & payload");
+    views.pinoutDialog.set("header", "UART Injector " + version);
 
+    // Dialog displaying the pinout to the user.
+    eventLoop.subscribe(views.pinoutDialog.input, function (_sub, button, gui, views) {
+        if (button === "center")
+            gui.viewDispatcher.switchTo(views.baudrateSubmenu);
+    }, gui, views);
+}
+
+function setupBaudRateUI() {
+    let baudrates = [];
     for (let i = 0; i < BAUDRATES.length; i++) {
-        submenu.addItem(to_string(BAUDRATES[i]), i);
+        baudrates.push(BAUDRATES[i].toString());
     }
+    
+    views.baudrateSubmenu.set("items", baudrates);
+    views.baudrateSubmenu.set("header", "Choose Baudrate");
 
-    let baudrate = submenu.show();
-
-    if (baudrate === undefined) {
-        die("User pressed back");
-    }
-
-    baudrate = BAUDRATES[baudrate];
-    print("Baudrate: " + to_string(baudrate));
-
-    return baudrate;
+    // Handle when a user chooses a baudrate.
+    eventLoop.subscribe(views.baudrateSubmenu.chosen, function (_sub, index, gui, eventLoop, views) {
+        settings.baudrate = BAUDRATES[index];
+        gui.viewDispatcher.switchTo(views.payloadSubmenu);
+    }, gui, eventLoop, views);
 }
 
-function uiGetPayload() {
-    submenu.setHeader("Select Payload");
+function setupPayloadUI() {
+    let payloads = [];
     for (let i = 0; i < PAYLOADS.length; i++) {
-        submenu.addItem(PAYLOADS[i].title, i);
+        payloads.push(PAYLOADS[i].title);
     }
+    views.payloadSubmenu.set("items", payloads);
+    views.payloadSubmenu.set("header", "Select Payload");
 
-    let payload = submenu.show();
-    if (payload === undefined) {
-        die("User pressed back");
-    }
-
-    payload = PAYLOADS[payload];
-
-    print("Payload:\n" + payload.title);
-
-    return payload;
+    // Handle when a user chooses a payload.
+    eventLoop.subscribe(views.payloadSubmenu.chosen, function (_sub, index, gui, eventLoop, views) {
+        settings.payload = PAYLOADS[index];
+        gui.viewDispatcher.switchTo(views.logTextBox);
+        injectCmd();
+    }, gui, eventLoop, views);
 }
 
-function uiGetLogFilename() {
-    let filepath = log_folder + "/";
-    let logfile = "uart_log";
-    while (true) {
-        keyboard.setHeader("LogFile Name");
-        logfile = keyboard.text(26, logfile, true);
+function setupKeyboardUI() {
+    views.keyboard.set("defaultTextClear", true);
+    views.keyboard.set("minLength", 0);
+    views.keyboard.set("maxLength", 32);
+    views.keyboard.set("defaultText", "uart_log.txt");
+    views.keyboard.set("header", "LogFile Name");
+
+    // say hi after keyboard input
+    eventLoop.subscribe(views.keyboard.input, function (_sub, logfile, gui, views) {
+        views.keyboard.set("defaultText", logfile);
 
         if (logfile === undefined || logfile === "") {
-            if (uiConfirmDiscard()) {
-                return "";
-            }
-            logfile = "uart_log";
-            continue;
+            return
         }
 
         if (logfile.indexOf(".txt") === -1) {
             logfile += ".txt";
         }
+        views.keyboard.set("defaultText", logfile);
 
-        if (storage.exists(filepath + logfile)){
-            dialog.message("Error", "Log File Exist");
-        } else {
-            break;
+        if (storage.fileExists(log_folder + "/" + logfile)){
+            gui.viewDispatcher.switchTo(views.fileExistDialog);
+            return;
         }
-    }
-    return filepath + logfile;
+
+        settings.filepath = log_folder + "/" + logfile;
+        saveData();
+    }, gui, views);
 }
 
-function uiConfirmDiscard() {
-    let dialog_params = ({
-        header: "Exit without saving?",
-        text: "Do you want to discard data?",
-        button_left: "Yes",
-        button_right: "No",
-        button_center: undefined
-    });
+function setupconfirmDiscardDialog() {
+    views.confirmDiscardDialog.set("text", "Do you want to discard data?");
+    views.confirmDiscardDialog.set("left", "Yes");
+    views.confirmDiscardDialog.set("right", "No");
+    views.confirmDiscardDialog.set("header", "Exit without saving?");
 
-    let result = dialog.custom(dialog_params);
-    if (result === dialog_params.button_left) {
-        return true;
-    } else {
-        return false;
-    }
+    // Handle the users response to discarding without saving.
+    eventLoop.subscribe(views.confirmDiscardDialog.input, function (_sub, button, gui, views) {
+        if (button === "left")
+            logAppend("Save aborted by user.")
+            gui.viewDispatcher.switchTo(views.logTextBox);
+        if (button === "right")
+            gui.viewDispatcher.switchTo(views.keyboard);
+    }, gui, views);
+}
+
+function setupFileExistDialog() {
+    views.fileExistDialog.set("text", "Log File Exist");
+    views.fileExistDialog.set("center", "Ok");
+    views.fileExistDialog.set("header", "Error");
+
+    // Handle the file exist inputs.
+    eventLoop.subscribe(views.fileExistDialog.input, function (_sub, button, gui, views) {
+        if (button === "center")
+            gui.viewDispatcher.switchTo(views.keyboard);
+    }, gui, views);
+}
+
+function configureBackNavigation() {
+    // Handle back button presses depending on view.
+    eventLoop.subscribe(gui.viewDispatcher.navigation, function (_sub, _, gui, views, eventLoop) {
+        if (gui.viewDispatcher.currentView === views.pinoutDialog || gui.viewDispatcher.currentView === views.logTextBox) {
+            eventLoop.stop();
+            return;
+        }
+        if (gui.viewDispatcher.currentView === views.baudrateSubmenu) {
+            gui.viewDispatcher.switchTo(views.pinoutDialog);
+        }
+        if (gui.viewDispatcher.currentView === views.payloadSubmenu) {
+            gui.viewDispatcher.switchTo(views.baudrateSubmenu);
+        }
+        if (gui.viewDispatcher.currentView === views.keyboard) {
+            gui.viewDispatcher.switchTo(views.confirmDiscardDialog);
+        }
+        if (gui.viewDispatcher === views.fileExistDialog) {
+            gui.viewDispatcher.switchTo(views.keyboard);
+        }
+    }, gui, views, eventLoop);
 }
 
 ////////////////////////////////////////////
 // Main Code
 ////////////////////////////////////////////
-dialog.message("UART Injector " + version, "Use Pins 13/14, select\nbaud rate & payload");
-let baudrate = uiGetBaudrate();
-let payload = uiGetPayload();
-injectCmd(baudrate, payload);
+setupPinoutUI();
+setupBaudRateUI();
+setupPayloadUI();
+setupKeyboardUI();
+setupconfirmDiscardDialog();
+setupFileExistDialog();
+configureBackNavigation();
+
+// run UI
+gui.viewDispatcher.switchTo(views.pinoutDialog);
+eventLoop.run();
